@@ -603,13 +603,13 @@ def main():
                 except Exception as e:
                     st.error(f"❌ Failed to extract {uploaded_file.name}: {str(e)}")
             else:
-                # Regular PDF file
-                pdf_files.append(uploaded_file)
+                # Regular document file
+                doc_files.append(uploaded_file)
         
-        if pdf_files:
-            st.success(f"📚 Ready to process: {len(pdf_files)} PDF file(s)")
+        if doc_files:
+            st.success(f"📚 Ready to process: {len(doc_files)} document(s)")
             with st.expander("View files"):
-                for f in pdf_files:
+                for f in doc_files:
                     st.text(f"• {f.name}")
     
     # Process button
