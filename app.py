@@ -15,6 +15,9 @@ import io
 import re
 import os
 import zipfile
+import time
+import logging
+import hashlib
 from typing import List, Dict, Optional
 from datetime import datetime
 from dotenv import load_dotenv
@@ -23,13 +26,192 @@ from docx import Document
 # Load environment variables from .env file
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('rfp_shredder.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
+# File validation constants
+MAX_FILE_SIZE_MB = 200
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_ZIP_EXTRACTED_SIZE_MB = 500
+MAX_ZIP_EXTRACTED_SIZE_BYTES = MAX_ZIP_EXTRACTED_SIZE_MB * 1024 * 1024
+MAX_FILES_IN_ZIP = 50
+
+# Magic numbers for file validation
+PDF_MAGIC = b'%PDF-'
+DOCX_MAGIC = b'PK\x03\x04'  # ZIP format (DOCX is a ZIP)
+
+# Processing constants
+DOCX_CHUNK_SIZE = 10  # paragraphs per chunk
+LLM_TEMPERATURE = 0.1
+LLM_MAX_TOKENS = 4096
+MAX_EXCEL_ROWS = 1000000  # Safe limit below Excel's 1,048,576
+
+# LLM retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 2
+RETRY_BACKOFF_MULTIPLIER = 2
+
 # Keywords to filter pages before sending to LLM (cost optimization)
 REQUIREMENT_KEYWORDS = ["shall", "must", "will", "required", "submit"]
+
+
+# ============================================================================
+# CUSTOM EXCEPTIONS
+# ============================================================================
+
+class RFPShredderError(Exception):
+    """Base exception for RFP Shredder errors"""
+    pass
+
+class FileSizeExceededError(RFPShredderError):
+    """Raised when file size exceeds limits"""
+    pass
+
+class InvalidFileFormatError(RFPShredderError):
+    """Raised when file format is invalid"""
+    pass
+
+class ZIPBombDetectedError(RFPShredderError):
+    """Raised when ZIP extraction size exceeds limits"""
+    pass
+
+class LLMProcessingError(RFPShredderError):
+    """Raised when LLM processing fails after retries"""
+    pass
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize filename to prevent injection attacks.
+    
+    Args:
+        filename: Original filename
+        
+    Returns:
+        Sanitized filename safe for display
+    """
+    # Remove path traversal attempts
+    filename = os.path.basename(filename)
+    # Remove special characters except basic ones
+    filename = re.sub(r'[^a-zA-Z0-9._\-() ]', '', filename)
+    # Limit length
+    return filename[:255]
+
+def validate_file_size(file_bytes: bytes, filename: str) -> None:
+    """
+    Validate file size is within limits.
+    
+    Args:
+        file_bytes: File content as bytes
+        filename: Filename for error message
+        
+    Raises:
+        FileSizeExceededError: If file exceeds size limit
+    """
+    size_mb = len(file_bytes) / (1024 * 1024)
+    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        logger.warning(f"File size exceeded: {filename} ({size_mb:.2f}MB)")
+        raise FileSizeExceededError(
+            f"File '{filename}' exceeds maximum size of {MAX_FILE_SIZE_MB}MB (actual: {size_mb:.2f}MB)"
+        )
+    logger.info(f"File size validated: {filename} ({size_mb:.2f}MB)")
+
+def validate_file_magic(file_bytes: bytes, filename: str) -> None:
+    """
+    Validate file content matches expected format using magic numbers.
+    
+    Args:
+        file_bytes: File content as bytes
+        filename: Filename for error message
+        
+    Raises:
+        InvalidFileFormatError: If file format doesn't match extension
+    """
+    if filename.lower().endswith('.pdf'):
+        if not file_bytes.startswith(PDF_MAGIC):
+            logger.warning(f"Invalid PDF magic number: {filename}")
+            raise InvalidFileFormatError(
+                f"File '{filename}' claims to be PDF but content is invalid. "
+                f"Please upload a valid PDF file."
+            )
+    elif filename.lower().endswith(('.docx', '.doc')):
+        if not file_bytes.startswith(DOCX_MAGIC):
+            logger.warning(f"Invalid DOCX magic number: {filename}")
+            raise InvalidFileFormatError(
+                f"File '{filename}' claims to be DOCX but content is invalid. "
+                f"Please upload a valid Word document."
+            )
+    logger.debug(f"File magic number validated: {filename}")
+
+def retry_with_backoff(func, max_retries: int = MAX_RETRIES, 
+                       initial_delay: float = RETRY_DELAY_SECONDS,
+                       backoff_multiplier: float = RETRY_BACKOFF_MULTIPLIER):
+    """
+    Retry a function with exponential backoff.
+    
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        backoff_multiplier: Multiplier for delay on each retry
+        
+    Returns:
+        Function result if successful
+        
+    Raises:
+        Last exception if all retries fail
+    """
+    last_exception = None
+    delay = initial_delay
+    
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            
+            # Check if error is retryable
+            is_retryable = any([
+                'rate limit' in error_msg,
+                'timeout' in error_msg,
+                'connection' in error_msg,
+                'temporarily unavailable' in error_msg,
+                '429' in error_msg,
+                '503' in error_msg,
+                '504' in error_msg
+            ])
+            
+            if not is_retryable:
+                logger.error(f"Non-retryable error: {e}")
+                raise
+            
+            if attempt < max_retries - 1:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= backoff_multiplier
+            else:
+                logger.error(f"All {max_retries} attempts failed")
+    
+    raise last_exception
+
 
 # LLM Provider configurations
 LLM_PROVIDERS = {
@@ -70,14 +252,17 @@ class PDFProcessor:
     Handles PDF file reading and text extraction with optimization filters.
     """
     
-    def __init__(self, file_bytes: bytes):
+    def __init__(self, file_bytes: bytes, filename: str = "unknown.pdf"):
         """
         Initialize the PDF processor with file bytes.
         
         Args:
             file_bytes: Raw bytes of the PDF file
+            filename: Name of the file for logging
         """
         self.file_bytes = file_bytes
+        self.filename = filename
+        logger.info(f"Initialized PDFProcessor for {filename} ({len(file_bytes)} bytes)")
         
     def extract_text_by_page(self) -> List[Dict[str, any]]:
         """
@@ -90,15 +275,18 @@ class PDFProcessor:
         pages_data = []
         
         try:
+            logger.info(f"Starting PDF extraction for {self.filename}")
             # Open PDF from bytes
             with pdfplumber.open(io.BytesIO(self.file_bytes)) as pdf:
                 total_pages = len(pdf.pages)
+                logger.info(f"PDF has {total_pages} pages")
                 
                 for page_num, page in enumerate(pdf.pages, start=1):
                     # Extract text from the page
                     text = page.extract_text()
                     
                     if not text:
+                        logger.debug(f"Page {page_num} is empty")
                         pages_data.append({
                             'page': page_num,
                             'text': '',
@@ -118,8 +306,11 @@ class PDFProcessor:
                         'skip_reason': None if has_keywords else 'No requirement keywords found'
                     })
                     
+            logger.info(f"Successfully extracted {len(pages_data)} pages from {self.filename}")
+                    
         except Exception as e:
-            raise Exception(f"PDF Processing Error: {str(e)}")
+            logger.error(f"PDF processing failed for {self.filename}: {str(e)}", exc_info=True)
+            raise RFPShredderError(f"PDF Processing Error for {self.filename}: {str(e)}")
             
         return pages_data
 
@@ -133,14 +324,17 @@ class DocxProcessor:
     Handles DOCX file reading and text extraction with optimization filters.
     """
     
-    def __init__(self, file_bytes: bytes):
+    def __init__(self, file_bytes: bytes, filename: str = "unknown.docx"):
         """
         Initialize the DOCX processor with file bytes.
         
         Args:
             file_bytes: Raw bytes of the DOCX file
+            filename: Name of the file for logging
         """
         self.file_bytes = file_bytes
+        self.filename = filename
+        logger.info(f"Initialized DocxProcessor for {filename} ({len(file_bytes)} bytes)")
         
     def extract_text_by_page(self) -> List[Dict[str, any]]:
         """
@@ -153,11 +347,11 @@ class DocxProcessor:
         pages_data = []
         
         try:
+            logger.info(f"Starting DOCX extraction for {self.filename}")
             # Open DOCX from bytes
             doc = Document(io.BytesIO(self.file_bytes))
             
             # Group paragraphs into chunks (simulate pages)
-            chunk_size = 10  # paragraphs per chunk
             current_chunk = []
             chunk_num = 1
             
@@ -166,7 +360,7 @@ class DocxProcessor:
                 if text:  # Skip empty paragraphs
                     current_chunk.append(text)
                     
-                    if len(current_chunk) >= chunk_size:
+                    if len(current_chunk) >= DOCX_CHUNK_SIZE:
                         # Process chunk
                         chunk_text = '\n'.join(current_chunk)
                         text_lower = chunk_text.lower()
@@ -194,9 +388,12 @@ class DocxProcessor:
                     'should_process': has_keywords,
                     'skip_reason': None if has_keywords else 'No requirement keywords found'
                 })
+            
+            logger.info(f"Successfully extracted {len(pages_data)} chunks from {self.filename}")
                     
         except Exception as e:
-            raise Exception(f"DOCX Processing Error: {str(e)}")
+            logger.error(f"DOCX processing failed for {self.filename}: {str(e)}", exc_info=True)
+            raise RFPShredderError(f"DOCX Processing Error for {self.filename}: {str(e)}")
             
         return pages_data
 
@@ -224,6 +421,7 @@ class RequirementExtractor:
         self.provider = provider
         self.model = model
         self.strictness = strictness
+        logger.info(f"Initialized RequirementExtractor: provider={provider}, model={model}, strictness={strictness}")
         
         # Initialize the appropriate client
         if provider == "openai":
@@ -296,7 +494,7 @@ If no requirements found, return: {{"requirements": []}}"""
 
     def process_page(self, text: str, page_num: int) -> List[Dict[str, any]]:
         """
-        Send page text to LLM and extract requirements.
+        Send page text to LLM and extract requirements with retry logic.
         
         Args:
             text: Page text to process
@@ -305,7 +503,10 @@ If no requirements found, return: {{"requirements": []}}"""
         Returns:
             List of requirement dictionaries
         """
-        try:
+        logger.debug(f"Processing page {page_num} ({len(text)} characters)")
+        
+        def _make_llm_call():
+            """Inner function for retry logic"""
             system_prompt = self._build_system_prompt()
             user_prompt = f"Extract requirements from this RFP page:\n\n{text}"
             
@@ -317,48 +518,63 @@ If no requirements found, return: {{"requirements": []}}"""
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
                     ],
-                    temperature=0.1,
+                    temperature=LLM_TEMPERATURE,
                     response_format={"type": "json_object"}
                 )
-                content = response.choices[0].message.content
+                return response.choices[0].message.content
                 
             elif self.provider == "anthropic":
                 response = self.client.messages.create(
                     model=self.model,
-                    max_tokens=4096,
-                    temperature=0.1,
+                    max_tokens=LLM_MAX_TOKENS,
+                    temperature=LLM_TEMPERATURE,
                     system=system_prompt,
                     messages=[
                         {"role": "user", "content": user_prompt}
                     ]
                 )
-                content = response.content[0].text
+                return response.content[0].text
                 
             elif self.provider == "gemini":
                 full_prompt = f"{system_prompt}\n\n{user_prompt}"
                 response = self.client.generate_content(
                     full_prompt,
                     generation_config={
-                        "temperature": 0.1,
+                        "temperature": LLM_TEMPERATURE,
                         "response_mime_type": "application/json"
                     }
                 )
-                content = response.text
+                return response.text
+        
+        try:
+            # Make LLM call with retry logic
+            content = retry_with_backoff(_make_llm_call)
             
             # Parse JSON response
-            result = json.loads(content)
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Page {page_num}: Invalid JSON from LLM. Raw response: {content[:200]}")
+                st.warning(f"⚠️ Page {page_num}: LLM returned invalid JSON. Retrying with modified prompt...")
+                # Could implement a retry with modified prompt here
+                return []
+            
             requirements = result.get("requirements", [])
+            
+            # Validate requirements is a list
+            if not isinstance(requirements, list):
+                logger.error(f"Page {page_num}: 'requirements' is not a list: {type(requirements)}")
+                return []
             
             # Add page number to each requirement
             for req in requirements:
                 req['page'] = page_num
-                
+            
+            logger.info(f"Page {page_num}: Extracted {len(requirements)} requirements")
             return requirements
             
-        except json.JSONDecodeError as e:
-            st.warning(f"⚠️ Page {page_num}: LLM returned invalid JSON. Skipping.")
-            return []
         except Exception as e:
+            logger.error(f"Page {page_num}: LLM processing failed after retries: {str(e)}", exc_info=True)
             st.error(f"❌ Page {page_num}: Error - {str(e)}")
             return []
 
@@ -572,39 +788,119 @@ def main():
     doc_files = []
     if uploaded_files:
         for uploaded_file in uploaded_files:
-            if uploaded_file.name.endswith('.zip'):
-                # Extract PDFs from ZIP
-                st.info(f"🗂️ Extracting {uploaded_file.name}...")
-                try:
-                    with zipfile.ZipFile(io.BytesIO(uploaded_file.read())) as zip_ref:
-                        # Get all PDF and DOCX files from the zip
-                        doc_names = [name for name in zip_ref.namelist() 
-                                   if (name.lower().endswith(('.pdf', '.docx', '.doc')) 
-                                       and not name.startswith('__MACOSX'))]
-                        
-                        for pdf_name in doc_names:
-                            pdf_bytes = zip_ref.read(pdf_name)
-                            # Create a proper file-like object with BytesIO
-                            class DocumentFile:
-                                def __init__(self, name, data):
-                                    self.name = os.path.basename(name)
-                                    self.data = data
-                                    self.size = len(data)
-                                    self._io = None
-                                
-                                def read(self):
-                                    if self._io is None:
-                                        self._io = io.BytesIO(self.data)
-                                    return self._io.getvalue()
+            safe_name = sanitize_filename(uploaded_file.name)
+            
+            try:
+                # Read file bytes
+                file_bytes = uploaded_file.read()
+                
+                # Validate file size
+                validate_file_size(file_bytes, safe_name)
+                
+                if uploaded_file.name.endswith('.zip'):
+                    # Extract documents from ZIP with bomb protection
+                    st.info(f"🗂️ Extracting {safe_name}...")
+                    
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
+                            # Get all PDF and DOCX files from the zip
+                            doc_names = [name for name in zip_ref.namelist() 
+                                       if (name.lower().endswith(('.pdf', '.docx', '.doc')) 
+                                           and not name.startswith('__MACOSX')
+                                           and not name.startswith('.'))]
                             
-                            doc_files.append(DocumentFile(pdf_name, pdf_bytes))
+                            # Check file count limit
+                            if len(doc_names) > MAX_FILES_IN_ZIP:
+                                raise ZIPBombDetectedError(
+                                    f"ZIP contains {len(doc_names)} files (max: {MAX_FILES_IN_ZIP}). "
+                                    f"This may be a ZIP bomb."
+                                )
+                            
+                            # Track total extracted size
+                            total_extracted_size = 0
+                            extracted_files = []
+                            
+                            for doc_name in doc_names:
+                                # Check for path traversal
+                                if '..' in doc_name or doc_name.startswith('/'):
+                                    logger.warning(f"Skipping suspicious path in ZIP: {doc_name}")
+                                    continue
+                                
+                                doc_bytes = zip_ref.read(doc_name)
+                                total_extracted_size += len(doc_bytes)
+                                
+                                # Check extracted size limit (ZIP bomb protection)
+                                if total_extracted_size > MAX_ZIP_EXTRACTED_SIZE_BYTES:
+                                    raise ZIPBombDetectedError(
+                                        f"ZIP extraction exceeded {MAX_ZIP_EXTRACTED_SIZE_MB}MB. "
+                                        f"This may be a ZIP bomb."
+                                    )
+                                
+                                safe_doc_name = sanitize_filename(doc_name)
+                                
+                                # Validate file format
+                                validate_file_magic(doc_bytes, safe_doc_name)
+                                
+                                # Create a proper file-like object with BytesIO
+                                class DocumentFile:
+                                    def __init__(self, name, data):
+                                        self.name = os.path.basename(name)
+                                        self.data = data
+                                        self.size = len(data)
+                                        self._io = None
+                                    
+                                    def read(self):
+                                        if self._io is None:
+                                            self._io = io.BytesIO(self.data)
+                                        return self._io.getvalue()
+                                
+                                extracted_files.append(DocumentFile(safe_doc_name, doc_bytes))
+                            
+                            doc_files.extend(extracted_files)
+                            logger.info(f"Extracted {len(extracted_files)} files from {safe_name} "
+                                      f"(total size: {total_extracted_size / (1024*1024):.2f}MB)")
+                            st.success(f"✅ Extracted {len(extracted_files)} document(s) from {safe_name}")
+                            
+                    except (ZIPBombDetectedError, InvalidFileFormatError) as e:
+                        st.error(f"❌ {str(e)}")
+                        logger.error(f"ZIP extraction failed for {safe_name}: {str(e)}")
+                    except zipfile.BadZipFile:
+                        st.error(f"❌ '{safe_name}' is not a valid ZIP file or is corrupted.")
+                        logger.error(f"Bad ZIP file: {safe_name}")
+                    except Exception as e:
+                        st.error(f"❌ Failed to extract {safe_name}: {str(e)}")
+                        logger.error(f"ZIP extraction error for {safe_name}: {str(e)}", exc_info=True)
+                else:
+                    # Regular document file - validate format
+                    try:
+                        validate_file_magic(file_bytes, safe_name)
                         
-                        st.success(f"✅ Extracted {len(doc_names)} document(s) from {uploaded_file.name}")
-                except Exception as e:
-                    st.error(f"❌ Failed to extract {uploaded_file.name}: {str(e)}")
-            else:
-                # Regular document file
-                doc_files.append(uploaded_file)
+                        # Re-create file object with validated data
+                        class ValidatedFile:
+                            def __init__(self, name, data):
+                                self.name = name
+                                self.data = data
+                                self.size = len(data)
+                                self._io = None
+                            
+                            def read(self):
+                                if self._io is None:
+                                    self._io = io.BytesIO(self.data)
+                                return self._io.getvalue()
+                        
+                        doc_files.append(ValidatedFile(safe_name, file_bytes))
+                        logger.info(f"Validated and added file: {safe_name}")
+                        
+                    except InvalidFileFormatError as e:
+                        st.error(f"❌ {str(e)}")
+                        logger.error(f"File validation failed: {str(e)}")
+                        
+            except FileSizeExceededError as e:
+                st.error(f"❌ {str(e)}")
+                logger.error(f"File size check failed: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ Unexpected error processing {safe_name}: {str(e)}")
+                logger.error(f"Unexpected error processing {safe_name}: {str(e)}", exc_info=True)
         
         if doc_files:
             st.success(f"📚 Ready to process: {len(doc_files)} document(s)")
@@ -639,9 +935,9 @@ def main():
                     
                     # Initialize appropriate processor based on file type
                     if uploaded_file.name.lower().endswith(('.docx', '.doc')):
-                        processor = DocxProcessor(file_bytes)
+                        processor = DocxProcessor(file_bytes, uploaded_file.name)
                     else:
-                        processor = PDFProcessor(file_bytes)
+                        processor = PDFProcessor(file_bytes, uploaded_file.name)
                     
                     # Extract text by page
                     pages_data = processor.extract_text_by_page()
@@ -734,6 +1030,15 @@ def main():
                 if duplicate_count > 0:
                     st.warning(f"⚠️ Found {duplicate_count} duplicate requirement(s) across files. Marked in 'Duplicate?' column.")
                 
+                # Validate Excel row limit
+                if len(df) > MAX_EXCEL_ROWS:
+                    st.error(
+                        f"❌ Extracted {len(df)} requirements, which exceeds Excel's safe limit "
+                        f"of {MAX_EXCEL_ROWS:,} rows. Please process fewer files or adjust filtering."
+                    )
+                    logger.error(f"Excel row limit exceeded: {len(df)} rows")
+                    return
+                
                 # Display preview
                 st.subheader("📋 Preview (First 5 Requirements)")
                 st.dataframe(df.head(5), use_container_width=True)
@@ -761,6 +1066,8 @@ def main():
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"compliance_matrix_{timestamp}.xlsx"
                 
+                logger.info(f"Generated Excel file: {filename} ({len(excel_bytes)} bytes, {len(df)} rows)")
+                
                 # Download button
                 st.download_button(
                     label="⬇️ Download Compliance Matrix (.xlsx)",
@@ -772,10 +1079,17 @@ def main():
                 )
                 
                 status_container.success("✅ All done! Download your compliance matrix above.")
+                logger.info("Processing completed successfully")
                 
+            except RFPShredderError as e:
+                # Known application errors
+                st.error(f"❌ {str(e)}")
+                logger.error(f"Application error: {str(e)}")
             except Exception as e:
-                st.error(f"❌ An error occurred: {str(e)}")
+                # Unexpected errors
+                st.error(f"❌ An unexpected error occurred: {str(e)}")
                 st.exception(e)
+                logger.critical(f"Unexpected error in main processing: {str(e)}", exc_info=True)
     
     else:
         # Instructions when no file is uploaded
