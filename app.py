@@ -426,34 +426,19 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuration")
         
-        # LLM Provider Selection
-        st.subheader("1. AI Provider")
-        provider_choice = st.selectbox(
-            "Select LLM Provider",
-            options=list(LLM_PROVIDERS.keys()),
-            help="Choose between OpenAI or Anthropic"
-        )
-        
+        # Auto-configure AI provider from environment (hidden from user)
+        provider_choice = "Google Gemini 2.5 Flash (Recommended)"
         provider_config = LLM_PROVIDERS[provider_choice]
         
-        # API Key Input
-        st.subheader("2. API Key")
+        # Load API key from environment (required for deployment)
+        api_key = os.getenv(provider_config['env_var'])
         
-        # Check if API key exists in environment
-        env_key = os.getenv(provider_config['env_var'])
-        
-        if env_key and env_key != f"your-{provider_config['provider']}-api-key-here":
-            api_key = env_key
-            st.success(f"✅ {provider_config['provider'].title()} API key loaded from .env file")
-        else:
-            api_key = st.text_input(
-                f"{provider_config['provider'].title()} API Key",
-                type="password",
-                help="Your API key is never stored. Add it to .env file to auto-load."
-            )
+        if not api_key:
+            st.error("⚠️ Service configuration error. Please contact support.")
+            st.stop()
         
         # Strictness Level
-        st.subheader("3. Extraction Strictness")
+        st.subheader("1. Extraction Strictness")
         strictness = st.slider(
             "Strictness Level",
             min_value=1,
@@ -478,7 +463,7 @@ def main():
         st.caption(f"Mode: {strictness_desc.get(strictness, 'Balanced')}")
         
         # Page Skip Filter
-        st.subheader("4. Page Filter")
+        st.subheader("2. Page Filter")
         skip_first_pages = st.number_input(
             "Skip first N pages",
             min_value=0,
@@ -549,11 +534,6 @@ def main():
     
     # Process button
     if pdf_files:
-        # Validate API key
-        if not api_key:
-            st.warning("⚠️ Please enter your API key in the sidebar to continue.")
-            return
-        
         # Shred It button
         if st.button("🔥 **Shred It!**", type="primary", use_container_width=True):
             
